@@ -1,0 +1,298 @@
+---
+title: "Clasificador SVM: Paula Villa Martín"
+output: html_notebook
+---
+
+
+# 0. Librerías
+```{r}
+set.seed(42)
+library(tidyverse);
+library(caret);
+library(nortest);
+library(RWeka)
+library(ggplot2)
+library(liquidSVM)
+```
+
+# 1. Carga de datos
+```{r}
+train_labels <- read.csv("train_labels.csv")
+train_values <- read.csv("train_values.csv")
+test_values <- read.csv("test_values.csv")
+# Conversión de las columnas con datos categóricos a factores:
+cols_to_factor <- c(9:15, 27)
+train_values[cols_to_factor] <- lapply(train_values[cols_to_factor], factor)
+test_values[cols_to_factor] <- lapply(test_values[cols_to_factor], factor)
+train_labels$damage_grade <- factor(train_labels$damage_grade)
+```
+
+# 2. Análisis exploratorio de los datos
+```{r}
+data <- merge(x = train_values, y = train_labels, by = 'building_id')
+head(data)
+#(Para análisis de datos ver jupyter notebook del EDA común del equipo)
+```
+
+
+# 3. Selección de variables
+```{r}
+# Eliminamos las variables correlacionadas, y que no aportan información respecto al grado de daño.
+excluded_vars <- c(
+  'count_families',
+  'land_surface_condition',
+  'has_superstructure_timber',
+  'has_superstructure_bamboo',
+  'has_superstructure_other',
+  'has_superstructure_cement_mortar_stone',
+  'has_superstructure_mud_mortar_brick',
+  'has_secondary_use',
+  'has_secondary_use_use_police',
+  'has_secondary_use_agriculture',
+  'has_secondary_use_hotel',
+  'has_secondary_use_industry',
+  'position'
+)
+train_values <- train_values %>% select(-all_of(excluded_vars))
+test_values <- test_values %>% select(-all_of(excluded_vars))
+train_values <- train_values %>% select(-building_id)
+```
+
+
+# 4. Variables categóricas
+## 4.1. Agrupación según diferencia relativa
+```{r}
+group_label <- function(x, label1, label2, new_label) {
+  x <- sub(label1, new_label, x)
+  x <- sub(label2, new_label, x)
+}
+group_cat <- function(data, var, label1, label2, grouped_label) {
+  as.factor(sapply(data[, var], group_label, label1, label2, grouped_label))
+}
+# Train
+train_values$foundation_type <- group_cat(train_values,"foundation_type", "^u$", "^w$", "u+w")
+train_values$ground_floor_type <- group_cat(train_values,"ground_floor_type", "^f$", "^x$", "f+x")
+train_values$ground_floor_type <- group_cat(train_values,"ground_floor_type", "^m$", "^z$", "m+z")
+train_values$plan_configuration <- sub("^a$", "a+c+m+o+u", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^c$", "a+c+m+o+u", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^m$", "a+c+m+o+u", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^o$", "a+c+m+o+u", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^u$", "a+c+m+o+u", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^d$", "d+n+q", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^n$", "d+n+q", train_values$plan_configuration)
+train_values$plan_configuration <- sub("^q$", "d+n+q", train_values$plan_configuration)
+train_values$roof_type <- group_cat(train_values,"roof_type", "^n$", "^q$", "n+q")
+train_values$other_floor_type <- group_cat(train_values,"other_floor_type", "^q$", "^x$", "q+x")
+train_values$legal_ownership_status <- group_cat(train_values,"legal_ownership_status", "^r$", "^v$", "r+v")
+# Test
+test_values$foundation_type <- group_cat(test_values,"foundation_type", "^u$", "^w$", "u+w")
+test_values$ground_floor_type <- group_cat(test_values,"ground_floor_type", "^f$", "^x$", "f+x")
+test_values$ground_floor_type <- group_cat(test_values,"ground_floor_type", "^m$", "^z$", "m+z")
+test_values$plan_configuration <- sub("^a$", "a+c+m+o+u", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^c$", "a+c+m+o+u", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^m$", "a+c+m+o+u", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^o$", "a+c+m+o+u", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^u$", "a+c+m+o+u", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^d$", "d+n+q", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^n$", "d+n+q", test_values$plan_configuration)
+test_values$plan_configuration <- sub("^q$", "d+n+q", test_values$plan_configuration)
+test_values$roof_type <- group_cat(test_values,"roof_type", "^n$", "^q$", "n+q")
+test_values$other_floor_type <- group_cat(test_values,"other_floor_type", "^q$", "^x$", "q+x")
+test_values$legal_ownership_status <- group_cat(test_values,"legal_ownership_status", "^r$", "^v$", "r+v")
+```
+
+## 4.2. Agrupamiento de variables de superestructura de la siguiente forma:
+```{r}
+#WEAK: `mud_mortar_stone`, `stone_flag`,`adobe_mud`.
+#ROBUST: `rc_non_engineered`, `rc_engineered`, `cement_mortar_brick`.
+group_superstructure <- function(data) {
+  # División en: weak, robust
+  data <- data %>% mutate(superstructure =
+      ifelse(has_superstructure_adobe_mud == 1 |
+             has_superstructure_mud_mortar_stone == 1 |
+             has_superstructure_stone_flag, 'weak','robust')
+  )
+  # Convertimos a factor y eliminamos las variables ya agurpadas
+  data$superstructure <- as.factor(data$superstructure)
+  data <- data %>% select(-starts_with('has_superstructure_'))
+}
+train_values <- group_superstructure(train_values)
+test_values <- group_superstructure(test_values)
+names(train_values)
+```
+
+## 4.3. Aplicación de one-hot encoding sobre variables categóricas.
+```{r}
+is_categorical_var <- sapply(data, is.factor)
+cat_vars <- data[, is_categorical_var]
+names(cat_vars)
+
+one_hot_encoding <- function(data) {
+  is_categorical_var <- sapply(data, is.factor)
+  cat_vars <- data[, is_categorical_var]
+  
+  dummy <- caret::dummyVars(' ~ .', data = cat_vars)
+  data.frame(predict(dummy, newdata = cat_vars))
+}
+dummy_train <- one_hot_encoding(train_values)
+dummy_test <- one_hot_encoding(test_values)
+
+# Remove duplicated information
+excluded_vars <- c(
+  'foundation_type.u.w',
+  'roof_type.n.q',
+  'ground_floor_type.f.x',
+  'other_floor_type.q.x',
+  'legal_ownership_status.r.v',
+  'superstructure.weak'
+)
+
+dummy_train <- dummy_train %>% select(-all_of(excluded_vars))
+dummy_test <- dummy_test %>% select(-all_of(excluded_vars))
+
+```
+
+# 5. Variables numéricas
+```{r}
+is_numeric_var <- c("geo_level_1_id","geo_level_2_id","geo_level_3_id",
+                    "count_floors_pre_eq","age","area_percentage",
+                    "height_percentage")
+#Estandarización y normalización
+preProc <- preProcess(train_values[, is_numeric_var], method = c('center', 'scale'))
+train_values[, is_numeric_var] <- predict(preProc, train_values[, is_numeric_var])
+test_values[, is_numeric_var] <-predict(preProc, test_values[, is_numeric_var])
+```
+
+# 6. Selección de variables por importancia
+```{r}
+num_vars_train <- train_values[, is_numeric_var]
+num_vars_test <- test_values[, is_numeric_var]
+names(num_vars_train)
+train_values <- data.frame(num_vars_train,dummy_train)
+test_values <- data.frame(num_vars_test,dummy_test, building_id=test_values$building_id)
+train_data <- data.frame(train_values,damage_grade=train_labels$damage_grade)
+```
+
+## 6.1. Análisis PCA
+```{r}
+#library(factoextra)
+#pca <- prcomp(train_data[1:1000,1:3])
+#fviz_eig(pca)
+#groups <- as.factor(train_data[1:1000,9])
+#fviz_pca_ind(pca,
+#             col.ind = groups, # color by groups
+#             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+#             addEllipses = TRUE, # Concentration ellipses
+#             ellipse.type = "confidence",
+#             legend.title = "Groups",
+#             repel = TRUE
+#)
+```
+
+## 6.2. InfoGain
+```{r}
+importance_thr = 0.005
+var_importance <- InfoGainAttributeEval(damage_grade~ ., train_data)
+names(sort(var_importance[var_importance>importance_thr],decreasing=TRUE))
+train_values <- train_values[,var_importance > importance_thr]
+train_data <- data.frame(train_values,train_labels)
+test_values <- test_values %>% select(names(train_values),building_id)
+names(train_values)
+names(test_values)
+names(train_data)
+selected <- c("geo_level_2_id","geo_level_3_id","geo_level_1_id",
+              "superstructure.robust","foundation_type.r","ground_floor_type.v",
+              "roof_type.x","foundation_type.i","age","other_floor_type.s",
+              "count_floors_pre_eq","height_percentage","other_floor_type.j",
+              "area_percentage","legal_ownership_status.a","damage_grade")
+```
+
+# 7. Selección de instancias
+```{r}
+# Finalmente considero todas las instancias
+data_1 <- train_data %>% filter(damage_grade==1)
+data_2 <- train_data %>% filter(damage_grade==2)
+data_3 <- train_data %>% filter(damage_grade==3)
+table(data$damage_grade)
+set.seed(1)
+#num_instances <- 25000
+sampled_data_1 <- data_1 #sample_n(data_1, num_instances)
+sampled_data_2 <- data_2 #sample_n(data_2, num_instances)
+sampled_data_3 <- data_3 #sample_n(data_3, num_instances)
+train_data <- rbind(sampled_data_1,sampled_data_2,sampled_data_3)
+rows <- sample(nrow(train_data ))
+train_data <- train_data[rows, ]
+train_data <-train_data[,selected]
+train_values <- train_data %>% select(-damage_grade)
+train_labels <- train_data %>% select(damage_grade)
+```
+
+# 8. Modelo
+```{r}
+### MODELO clase 2
+n_select <- 4  # Número de variables considerado
+num_instances_test <- 5
+total_num_instances <- dim(train_data)[1]
+num_instances_train <- total_num_instances-num_instances_test
+num_instances_train
+values_for_train <- train_values[1:num_instances_train,1:n_select]
+labels_for_train <- as.factor(train_labels[1:num_instances_train,1])
+num_instances_train <- num_instances_train+1
+values_for_test <- train_values[num_instances_train:total_num_instances,1:n_select]
+labels_for_test <- as.factor(train_labels[num_instances_train:total_num_instances,1])
+data <- liquidData('banana-mc')
+data$train <- data.frame(Y=labels_for_train,values_for_train)
+data$test <- data.frame(Y=labels_for_test,values_for_test)
+data_2_eg <- data
+train_data_2_eg <- data_2_eg$train
+test_data_2_eg <- data_2_eg$test
+table(train_data_2_eg$Y)
+train_data_2_eg$Y <- as.factor(ifelse(as.numeric(train_data_2_eg$Y) >= 2, 1, 0))
+test_data_2_eg$Y <- as.factor(ifelse(as.numeric(test_data_2_eg$Y)>= 2, 1, 0))
+data_2_eg$train <- train_data_2_eg
+data_2_eg$test <- test_data_2_eg
+table(train_data_2_eg$Y)
+set.seed(1)
+model_2_eg <- svm(Y~., data_2_eg, display=1, threads=3, useCells=TRUE)
+errors(model_2_eg$last_result)
+
+## MODELO clase 3
+n_select <- 4  # Número de variables considerado
+num_instances_test <- 5
+total_num_instances <- dim(train_data)[1]
+num_instances_train <- total_num_instances-num_instances_test
+num_instances_train
+values_for_train <- train_values[1:num_instances_train,1:n_select]
+labels_for_train <- as.factor(train_labels[1:num_instances_train,1])
+num_instances_train <- num_instances_train+1
+values_for_test <- train_values[num_instances_train:total_num_instances,1:n_select]
+labels_for_test <- as.factor(train_labels[num_instances_train:total_num_instances,1])
+data <- liquidData('banana-mc')
+data$train <- data.frame(Y=labels_for_train,values_for_train)
+data$test <- data.frame(Y=labels_for_test,values_for_test)
+data_3_eg <- data
+train_data_3_eg <- data_3_eg$train
+test_data_3_eg<- data_3_eg$test
+table(train_data_3_eg$Y)
+train_data_3_eg$Y <- as.factor(ifelse(as.numeric(train_data_3_eg$Y) == 3, 1, 0))
+test_data_3_eg$Y <- as.factor(ifelse(as.numeric(test_data_3_eg$Y) == 3, 1, 0))
+data_3_eg$train <- train_data_3_eg
+data_3_eg$test <- test_data_3_eg
+table(train_data_3_eg$Y)
+set.seed(1)
+model_3_eg <- svm(Y~., data_3_eg, display=1, threads=3, useCells=TRUE)
+errors(model_3_eg$last_result)
+```
+
+# 9. Predicción de conjunto de datos de test
+```{r}
+values_to_predict <- test_values %>% select(selected[1:n_select])
+str(values_to_predict)
+result_test_2_eg  <- test(model_2_eg,values_to_predict)
+result_test_3_eg  <- test(model_3_eg,values_to_predict)
+final_label <- 1 + as.numeric(result_test_2_eg)-1 + as.numeric(result_test_3_eg)-1
+final_result <- data.frame(building_id=test_values$building_id, damage_grade=as.numeric(final_label))
+table(final_result$damage_grade)
+write.csv(final_result,"submission.csv", row.names = FALSE)
+```
+
